@@ -1,0 +1,258 @@
+<?php
+// $Id$
+
+/**
+ * @file
+ * Provides basic functions for using list fields for workflows.
+ */
+
+/**
+ * Implementation of hook_widget_type().
+ */
+function workflowfield_widget_info() {
+  return array(
+    'workflowfield' => array(
+      'label' => 'Workflow field',
+      'field types' => array('number_integer'),
+      'callbacks' => array(
+        'default value' => CONTENT_CALLBACK_DEFAULT,
+      ),
+    ),
+  );
+}
+
+/**
+ * Implementation of hook_form_alter() to change the field configuration form.
+ */
+function workflowfield_form_content_field_edit_form_alter(&$form, &$form_state) {
+  // Change standard fields in field configuration
+  if (isset($form['#field']) && $form['#field']['widget']['type'] == 'workflowfield') {
+    $form['widget']['default_value_fieldset']['#collapsed'] = FALSE;
+    $form['field']['required']['#value'] = TRUE;
+    $form['field']['required']['#access'] = FALSE;
+    $form['field']['multiple']['#value'] = 1;
+    $form['field']['multiple']['#access'] = FALSE;
+    unset($form['field']['append']);
+    $form['field']['min']['#value'] = 0;
+    $form['field']['min']['#access'] = FALSE;
+    unset($form['field']['max']);
+    $form['field']['allowed_values_fieldset']['#title'] = t('Workflow');
+    $form['field']['allowed_values_fieldset']['#collapsed'] = FALSE;
+    $form['field']['allowed_values_fieldset']['#description'] =
+      t('One workflow state per line. Workflows are identified by numbers, but
+        can have text descriptions if given on the form \'1|draft\' or
+        \'2|draft (ready for review)\'.');
+    $form['field']['allowed_values_fieldset']['allowed_values']['#title'] = t('Workflow states');
+    $form['field']['allowed_values_fieldset']['allowed_values']['#required'] = TRUE;
+    unset($form['field']['allowed_values_fieldset']['allowed_values']['#description']);
+
+  }
+}
+/**
+ * Implementation of hook_widget_settings().
+ */
+function workflowfield_widget_settings($op, $widget) {
+  if ($widget['type'] == 'workflowfield') {
+    switch ($op) {
+      case 'form':
+        // Add configuration for each possible workflow transition
+        $form = array();
+        // Sorry about the arg(5) below. I couldn't get the name of the field
+        // in any other way. :-(
+        $transitions = workflowfield_get_all_transitions(content_fields(arg(5)));
+        $form['transitions'] = array(
+          '#type' => 'fieldset',
+          '#tree' => TRUE,
+          '#title' => t('Workflow transitions'),
+          '#collapsible' => TRUE,
+          '#description' => t('Add a transition name for each workflow transition
+            you wish to enable. Each enabled transition will appear as a
+            permission in the !permissions-table.',
+              array('!permissions-table' =>
+                l('permissions table', 'admin/user/permissions'))),
+        );
+        foreach ($transitions as $key => $transition) {
+          $form[$key] = array(
+            '#type' => 'textfield',
+            '#name' => $key,
+            '#title' => $transition,
+            '#default value' => (isset($widget['transitions'][$key])) ? $widget['transitions'][$key] : NULL,
+            '#parent' => 'transitions',
+          );
+        }
+        return $form;
+
+      case 'save':
+        $transitions = workflowfield_get_all_transitions(content_fields(arg(5)));
+        $data = array('transitions');
+        foreach ($transitions as $key => $transition) {
+          $data[] = $key;
+        }
+        return array($data);
+    }
+  }
+}
+
+
+function workflowfield_form_alter(&$form, &$form_state) {
+  if ($form['#id'] == 'node-form') {
+    $workflow_fields = workflowfield_get_fields($form['#node']->type);
+    foreach($workflow_fields as $workflow_field) {
+      //$form[$workflow_field['field_name']]['#access'] = FALSE;
+      $transitions = workflowfield_get_allowed_transitions($workflow_field,
+        $form['#node']->{$workflow_field['field_name']}[0]['value']);
+      $form[$workflow_field['field_name']]['#options'] = $transitions;
+    }
+  }
+}
+
+/**
+ * Implementation of hook_nodeapi() to trigger rules on workflow transitions.
+ */
+function workflowfield_nodeapi(&$node, $op) {
+  if ($op == 'update') {
+
+    // Get all workflow fields for this node, and if there are any also the
+    // unsaved node to detect any workflow state changes.
+    $workflow_fields = workflowfield_get_fields($node->type);
+    if (count($workflow_fields)) {
+      $unsaved_node = node_load($node->nid);
+    }
+
+    // If workflow state has changed, invoke the appropriate rules event.
+    global $user;
+    foreach ($workflow_fields as $workflow_field) {
+      if ($node->{$workflow_field['field_name']}[0]['value'] !=
+        $unsaved_node->{$workflow_field['field_name']}[0]['value']
+      ) {
+        $author = user_load($node->uid);
+        // The first four lines of the expression below is the name of the
+        // workflow event, on the form workflow_fieldname_0_1.
+        rules_invoke_event(
+          'workflow_' .
+          $workflow_field['field_name'] . '_' .
+          $unsaved_node->{$workflow_field['field_name']}[0]['value'] . '_' .
+          $node->{$workflow_field['field_name']}[0]['value'],
+          array(
+            'node' => &$node,
+            'unsaved_node' => $unsaved_node,
+            'account' => &$user,
+            'author' => &$author,
+          )
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Helper function that returns workflow fields.
+ * @param String $type
+ *   The machine name of the node type to fetch workflow fields for. If omitted,
+ *   all node types will be examined.
+ * @return Array $workflow_fields
+ *   An array of workflow fields, on the same for as returned by content_fields().
+ */
+function workflowfield_get_fields($type = NULL) {
+  // This function is currently a hack, but will later on check for a particular
+  // property (widget?) in the field settings.
+  $fields = content_fields('', $type);
+  $workflow_fields = array();
+  foreach ($fields as $field) {
+    if ($field['type'] == 'number_integer'
+        && $field['widget']['type'] == 'optionwidgets_select'
+        && $field['multiple'] == 0
+        && $field['required'] == 1
+    ) {
+      $workflow_fields[] = $field;
+    }
+  }
+
+  return $workflow_fields;
+}
+
+/**
+ * Helper function for Workflow Fields listing state transitions for a field.
+ * @param Array $field
+ *   An array with field information, in the form returned by content_fields().
+ * @return Array
+ *   An array with possible workflow state transitions for the field. Values
+ *   are the names of to and from states, as named in the allowed values list.
+ *   Keyes are the number of the states, separated by underscore. An example
+ *   return could be array('1_2' => 'needs review -> approved').
+ */
+function workflowfield_get_all_transitions($field) {
+  // If there are no allowed values set, return FALSE and exit. This is
+  // the case if the field is freshly created and about to be configured.
+  if (!($field['allowed_values'])) {
+    return FALSE;
+  }
+
+  // Get the allowed values – these are the possible workflow states.
+  $raw_states = explode("\n", trim($field['allowed_values']));
+
+  // Build an array of workflow states on the form (number => name of state).
+  // If no state name is given, use the state integer instead.
+  $states = array();
+  foreach ($raw_states as $state) {
+    $parts = explode('|', $state);
+    $states[$parts[0]] = ($parts[1]) ? $parts[1] : $parts[0];
+  }
+
+  // Build an array of the transitions, on the form 0_1 => 'from state -> to state'.
+  $transitions = array();
+  foreach ($states as $from_number => $from_state) {
+    foreach ($states as $to_number => $to_state) {
+      // Exclude the case where from and to state are the same.
+      if ($from_number != $to_number) {
+        $transitions[$from_number . '_' . $to_number] = t('@from_state -> @to_state',
+          array('@from_state' => $from_state, '@to_state' => $to_state));
+      }
+    }
+  }
+
+  return $transitions;
+}
+
+function workflowfield_get_allowed_transitions($field, $current_state) {
+  // Get the allowed values – these are the possible target workflow states.
+  $raw_states = explode("\n", trim($field['allowed_values']));
+
+  // TODO: Limit the returned transitions based on user permissions.
+
+  // Build an array of workflow states on the form (number => name of state).
+  // If no name of state is given, use the state number instead.
+  $states = array();
+  foreach ($raw_states as $state) {
+    $parts = explode('|', $state);
+    $states[$parts[0]] = ($parts[1]) ? $parts[1] : $parts[0];
+  }
+
+  // Build an array of the transitions, on the form
+  // array(state number => 'from state -> to state')
+  $transitions = array();
+  foreach ($states as $to_number => $to_state) {
+    $transitions[$to_number] = t('@from_state -> @to_state',
+      array('@from_state' => $states[$current_state], '@to_state' => $to_state));
+  }
+
+  // Change transition name on current state to 'no changes'
+  $transitions[$current_state] = t('No changes');
+
+  return $transitions;
+}
+
+/**
+ * Implementation of hook_perm().
+ */
+function workflowfield_perm() {
+  // Build up a clunky list of all possible transitions.
+  $permissions = array();
+  foreach (workflowfield_get_fields() as $workflow_field) {
+    foreach (workflowfield_get_all_transitions($workflow_field) as $transition) {
+      $permissions[] = $workflow_field['field_name'] . ': ' . $transition;
+    }
+  }
+
+  return $permissions;
+}

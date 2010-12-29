@@ -1,0 +1,8 @@
+; $Id$
+name = "Workflow field"
+description = "Provides a CCK widget for using select lists as workflow states."
+package = "CCK"
+core = "6.x"
+dependencies[] = "content"
+dependencies[] = "text"
+dependencies[] = "rules"
